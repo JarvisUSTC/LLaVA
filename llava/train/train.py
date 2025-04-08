@@ -28,7 +28,7 @@ import transformers
 import tokenizers
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, ConcatDataset
 from llava.train.llava_trainer import LLaVATrainer
 
 from llava import conversation as conversation_lib
@@ -64,6 +64,7 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
+    noise_augmentation: bool = field(default=False)
 
 
 @dataclass
@@ -74,6 +75,7 @@ class DataArguments:
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
+    meta_data_path: Optional[str] = field(default=None)
 
 
 @dataclass
@@ -82,6 +84,9 @@ class TrainingArguments(transformers.TrainingArguments):
     optim: str = field(default="adamw_torch")
     remove_unused_columns: bool = field(default=False)
     freeze_mm_mlp_adapter: bool = field(default=False)
+    use_backbone_lora: bool = field(default=False)
+    use_llm_lora: bool = field(default=True)
+    freeze_llm: bool = field(default=False)
     mpt_attn_impl: Optional[str] = field(default="triton")
     model_max_length: int = field(
         default=512,
@@ -173,6 +178,18 @@ def find_all_linear_names(model):
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
+        if isinstance(module, cls):
+            names = name.split('.')
+            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+
+    if 'lm_head' in lora_module_names: # needed for 16-bit
+        lora_module_names.remove('lm_head')
+    return list(lora_module_names)
+
+def find_vision_linear_names(model):
+    cls = torch.nn.Linear
+    lora_module_names = set()
+    for name, module in model.named_modules():
         if isinstance(module, cls):
             names = name.split('.')
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
@@ -662,7 +679,21 @@ class LazySupervisedDataset(Dataset):
                  tokenizer: transformers.PreTrainedTokenizer,
                  data_args: DataArguments):
         super(LazySupervisedDataset, self).__init__()
-        list_data_dict = json.load(open(data_path, "r"))
+        if data_path[-5:] == ".json":
+            list_data_dict = json.load(open(data_path, "r"))
+        elif data_path[-6:] == ".jsonl":
+            list_data_dict = [json.loads(line) for line in open(data_path, "r")]
+        else:
+            raise ValueError("Unknown file format")
+        
+        repeat_time = getattr(data_args, "repeat_time", 1)
+        if repeat_time < 1:
+            # If repeat_time is less than 1, select a portion of the data
+            list_data_dict = list_data_dict[:int(len(list_data_dict) * repeat_time)]
+        if repeat_time > 1:
+            assert isinstance(repeat_time, int)
+            # Repeat the list if repeat_time is greater than 1
+            list_data_dict = list_data_dict * repeat_time
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
@@ -771,14 +802,47 @@ class DataCollatorForSupervisedDataset(object):
                 batch['images'] = images
 
         return batch
+class ConcatDatasetWithModalityLengths(ConcatDataset):
+    def __init__(self, datasets):
+        super().__init__(datasets)
 
+    @property
+    def modality_lengths(self):
+        length_list = []
+        
+        # 遍历所有数据集并获取样本
+        for dataset in self.datasets:
+            for sample in dataset.list_data_dict:
+                # 计算对话中的总单词数
+                cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
+                # 检查是否包含 'image'，并根据是否包含图像调整长度
+                cur_len = cur_len if 'image' in sample else -cur_len
+                length_list.append(cur_len)
+        
+        return length_list
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                 data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
-                                data_path=data_args.data_path,
-                                data_args=data_args)
+    if data_args.meta_data_path is None:
+        train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
+                                    data_path=data_args.data_path,
+                                    data_args=data_args)
+    else:
+        datasets = []
+        ds_collections = json.loads(open(data_args.meta_data_path).read())
+        for ds_idx, ds_name in enumerate(ds_collections.keys()):
+            data_args_copy = copy.deepcopy(data_args)
+            data_args_copy.repeat_time = ds_collections[ds_name]['repeat_time']
+            data_args_copy.image_folder = ds_collections[ds_name]['root']
+            data_path = ds_collections[ds_name]['annotation']
+
+            dataset = LazySupervisedDataset(tokenizer=tokenizer,
+                                       data_path=data_path,
+                                       data_args=data_args_copy)
+            logging.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
+            datasets.append(dataset)
+        train_dataset = ConcatDatasetWithModalityLengths(datasets)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset,
                 eval_dataset=None,
@@ -844,6 +908,9 @@ def train(attn_implementation=None):
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
+    if training_args.freeze_llm:
+        model.model.requires_grad_(False)
+
     if training_args.bits in [4, 8]:
         from peft import prepare_model_for_kbit_training
         model.config.torch_dtype=(torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
@@ -857,7 +924,7 @@ def train(attn_implementation=None):
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-    if training_args.lora_enable:
+    if training_args.lora_enable and training_args.use_llm_lora:
         from peft import LoraConfig, get_peft_model
         lora_config = LoraConfig(
             r=training_args.lora_r,
@@ -912,7 +979,23 @@ def train(attn_implementation=None):
             model_args=model_args,
             fsdp=training_args.fsdp
         )
-        
+    
+        if training_args.use_backbone_lora:
+            from peft import LoraConfig, get_peft_model
+            lora_config = LoraConfig(
+                r=training_args.lora_r,
+                lora_alpha=training_args.lora_alpha,
+                target_modules=find_vision_linear_names(model.get_vision_tower()),
+                lora_dropout=training_args.lora_dropout,
+                bias=training_args.lora_bias,
+            )
+            if training_args.use_llm_lora:
+                model.model.model.vision_tower = get_peft_model(model.get_vision_tower(), lora_config)
+                model.model.model.vision_tower.print_trainable_parameters()
+            else:
+                model.model.vision_tower = get_peft_model(model.get_vision_tower(), lora_config)
+                model.model.vision_tower.print_trainable_parameters()
+
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 

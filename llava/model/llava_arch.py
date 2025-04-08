@@ -67,6 +67,7 @@ class LlavaMetaModel:
                 vision_tower = self.vision_tower[0]
             else:
                 vision_tower = self.vision_tower
+            vision_tower.noise_aug = getattr(model_args, 'noise_augmentation', False)
             vision_tower.load_model()
 
         self.config.use_mm_proj = True
